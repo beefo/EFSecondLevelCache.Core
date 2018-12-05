@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Threading;
 using CacheManager.Core;
 using EFSecondLevelCache.Core.Contracts;
 
@@ -13,7 +14,8 @@ namespace EFSecondLevelCache.Core
         private static readonly EFCacheKey _nullObject = new EFCacheKey();
         private readonly ICacheManager<ISet<string>> _dependenciesCacheManager;
         private readonly ICacheManager<object> _valuesCacheManager;
-        private readonly TimeSpan _cacheItemRemoveTimeout = TimeSpan.FromTicks(1);
+        private readonly ReaderWriterLockSlim _vcmReaderWriterLock = new ReaderWriterLockSlim();
+        private readonly ReaderWriterLockSlim _dcReaderWriterLock = new ReaderWriterLockSlim();
 
         /// <summary>
         /// Some cache providers won't accept null values.
@@ -37,8 +39,8 @@ namespace EFSecondLevelCache.Core
         /// </summary>
         public void ClearAllCachedEntries()
         {
-            _valuesCacheManager.Clear();
-            _dependenciesCacheManager.Clear();
+            TryWriteLocked(_vcmReaderWriterLock, () => _valuesCacheManager.Clear());
+            TryWriteLocked(_dcReaderWriterLock, () => _dependenciesCacheManager.Clear());
         }
 
         /// <summary>
@@ -67,15 +69,18 @@ namespace EFSecondLevelCache.Core
 
             foreach (var rootCacheKey in rootCacheKeys)
             {
-                _dependenciesCacheManager.AddOrUpdate(rootCacheKey, new HashSet<string> { cacheKey },
-                    updateValue: set =>
-                                    {
-                                        set.Add(cacheKey);
-                                        return set;
-                                    });
+                TryWriteLocked(_dcReaderWriterLock, () =>
+                {
+                    _dependenciesCacheManager.AddOrUpdate(rootCacheKey, new HashSet<string> { cacheKey },
+                        updateValue: set =>
+                        {
+                            set.Add(cacheKey);
+                            return set;
+                        });
+                });
             }
 
-            _valuesCacheManager.Add(cacheKey, value);
+            TryWriteLocked(_vcmReaderWriterLock, () => _valuesCacheManager.Add(cacheKey, value));
         }
 
         /// <summary>
@@ -92,21 +97,56 @@ namespace EFSecondLevelCache.Core
                 }
 
                 clearDependencyValues(rootCacheKey);
-                _dependenciesCacheManager.Expire(rootCacheKey, ExpirationMode.Absolute, _cacheItemRemoveTimeout);
+                TryWriteLocked(_dcReaderWriterLock, () => _dependenciesCacheManager.Remove(rootCacheKey));
             }
         }
 
         private void clearDependencyValues(string rootCacheKey)
         {
-            var dependencyKeys = _dependenciesCacheManager.Get(rootCacheKey);
-            if (dependencyKeys == null)
-            {
-                return;
-            }
+           TryReadLocked(_dcReaderWriterLock, () =>
+           {
+               var dependencyKeys = _dependenciesCacheManager.Get(rootCacheKey);
+               if (dependencyKeys == null)
+               {
+                   return;
+               }
 
-            foreach (var dependencyKey in dependencyKeys)
+               foreach (var dependencyKey in dependencyKeys)
+               {
+                   TryWriteLocked(_vcmReaderWriterLock, () => _valuesCacheManager.Remove(dependencyKey));
+               }
+           });
+        }
+
+        private static void TryReadLocked(ReaderWriterLockSlim readerWriterLock, Action action, int timeout = Timeout.Infinite)
+        {
+            if (!readerWriterLock.TryEnterReadLock(timeout))
             {
-                _valuesCacheManager.Expire(dependencyKey, ExpirationMode.Absolute, _cacheItemRemoveTimeout);
+                throw new TimeoutException();
+            }
+            try
+            {
+                action();
+            }
+            finally
+            {
+                readerWriterLock.ExitReadLock();
+            }
+        }
+
+        private static void TryWriteLocked(ReaderWriterLockSlim readerWriterLock, Action action, int timeout = Timeout.Infinite)
+        {
+            if (!readerWriterLock.TryEnterWriteLock(timeout))
+            {
+                throw new TimeoutException();
+            }
+            try
+            {
+                action();
+            }
+            finally
+            {
+                readerWriterLock.ExitWriteLock();
             }
         }
     }
